@@ -1,0 +1,21 @@
+name: build
+on: [push, workflow_dispatch]
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
+      - name: Install Android SDK
+        run: |
+          mkdir -p $HOME/sdk/cmdline-tools && cd $HOME/sdk/cmdline-tools
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q commandlinetools-linux-11076708_latest.zip
+          mv cmdline-tools latest
+          yes | latest/bin/sdkmanager --sdk_root=$HOME/sdk --licenses > /dev/null
+          latest/bin/sdkmanager --sdk_root=$HOME/sdk "build-tools;34.0.0" "platforms;android-34" > /dev/null
+      - name: Build
+        run: bash build.sh $HOME/sdk
+      - uses: actions/upload-artifact@v4
+        with: { name: AudioBridge, path: out/AudioBridge.apk }
