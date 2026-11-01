@@ -1,10 +1,12 @@
 package com.termuxbridge.audiobridge;
 
+import android.Manifest;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
 import android.media.AudioAttributes;
 import android.media.AudioFormat;
@@ -19,21 +21,32 @@ import android.os.SystemClock;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.net.BindException;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class CaptureService extends Service {
     private static final int PORT = 48210;
     private static final int LOGPORT = 48211;
+    private static final AtomicBoolean ACTIVE = new AtomicBoolean(false);
+
     private volatile boolean running = true;
     private final StringBuffer log = new StringBuffer();
 
     private int lastCode = 0;
     private Intent lastData = null;
+
     private ServerSocket audioServer = null;
+    private ServerSocket logServerSocket = null;
+
     private AudioRecord recorder = null;
     private MediaProjection projection = null;
+
+    private boolean captureStereo = false;
+    private byte[] buf = new byte[32768];
+    private byte[] monoBuf = new byte[65536];
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
@@ -41,128 +54,385 @@ public class CaptureService extends Service {
             lastCode = intent.getIntExtra("code", 0);
             lastData = intent.getParcelableExtra("data");
         }
-        startForeground(1, makeNotif(),
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
+
+        if (!ACTIVE.compareAndSet(false, true)) {
+            L("service already active; start ignored. If stuck, Force Stop AudioBridge then open again.");
+            return START_NOT_STICKY;
+        }
+
+        running = true;
+
+        try {
+            startForeground(
+                1,
+                makeNotif(),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION |
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            );
+        } catch (Throwable t) {
+            L("startForeground typed failed: " + t);
+            try {
+                startForeground(1, makeNotif());
+            } catch (Throwable t2) {
+                L("startForeground fallback failed: " + t2);
+            }
+        }
+
         new Thread(this::logServer, "logdump").start();
         new Thread(this::boot, "bridge").start();
+
         return START_NOT_STICKY;
     }
 
     private void L(String s) {
-        log.append(s).append('\n');
+        synchronized (log) {
+            log.append(s).append('\n');
+        }
     }
 
     private void boot() {
-        L("=== AudioBridge v2 ===");
-        L("model=" + Build.MODEL + " brand=" + Build.BRAND + " sdk=" + Build.VERSION.SDK_INT);
-
-        try { micSelfTest(); } catch (Throwable t) { L("MIC ERR " + t); }
-
         try {
-            if (lastData == null) { L("PROJECTION NULL -> consent ilang, buka app lagi & Allow"); return; }
+            L("=== AudioBridge v3 ===");
+            L("model=" + Build.MODEL + " brand=" + Build.BRAND + " sdk=" + Build.VERSION.SDK_INT);
+
+            boolean micPerm = checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                    == PackageManager.PERMISSION_GRANTED;
+            L("RECORD_AUDIO=" + (micPerm ? "GRANTED" : "DENIED"));
+
+            if (!micPerm) {
+                L("Mic permission denied. Allow microphone for AudioBridge in Settings, then open app again.");
+                stopSelf();
+                return;
+            }
+
+            boolean micOk = micSelfTest();
+            L("micOverall=" + (micOk ? "OK" : "ZERO/BLOCKED"));
+
+            if (lastData == null) {
+                L("No projection data. Open app and Allow capture.");
+                stopSelf();
+                return;
+            }
+
             MediaProjectionManager mpm =
                 (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
+
             projection = mpm.getMediaProjection(lastCode, lastData);
-            if (projection == null) { L("PROJECTION NULL -> consent ilang, buka app lagi & Allow"); return; }
+            if (projection == null) {
+                L("MediaProjection null. Consent expired. Open app and Allow again.");
+                stopSelf();
+                return;
+            }
             L("projection OK");
 
-            AudioPlaybackCaptureConfiguration cfg =
-                new AudioPlaybackCaptureConfiguration.Builder(projection)
-                    .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
-                    .addMatchingUsage(AudioAttributes.USAGE_GAME)
-                    .build();
+            recorder = startPlaybackCapture(true);
+            if (recorder == null) {
+                L("stereo capture failed, trying mono...");
+                recorder = startPlaybackCapture(false);
+            }
 
-            int rate = 48000;
-            int minBuf = AudioRecord.getMinBufferSize(rate,
-                AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT);
-            L("minBuf(stereo)=" + minBuf);
+            if (recorder == null) {
+                L("Playback capture could not start.");
+                stopSelf();
+                return;
+            }
 
-            recorder = new AudioRecord.Builder()
-                .setAudioPlaybackCaptureConfig(cfg)
-                .setAudioFormat(new AudioFormat.Builder()
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setSampleRate(rate)
-                    .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
-                    .build())
-                .setBufferSizeInBytes(Math.max(Math.abs(minBuf) * 4, 131072))
-                .build();
+            L("capture mode=" + (captureStereo ? "stereo downmixed to mono" : "mono"));
 
-            L("rec.state=" + recorder.getState() + " (1=INITIALIZED)");
-            recorder.startRecording();
-            L("rec.recstate=" + recorder.getRecordingState() + " (2=RECORDING)");
+            audioServer = new ServerSocket();
+            audioServer.setReuseAddress(true);
 
-            audioServer = new ServerSocket(PORT, 5, InetAddress.getByName("127.0.0.1"));
+            try {
+                audioServer.bind(
+                    new java.net.InetSocketAddress(InetAddress.getByName("127.0.0.1"), PORT),
+                    5
+                );
+            } catch (BindException be) {
+                L("PORT " + PORT + " already in use. Force stop AudioBridge, kill ffmpeg/rec2.sh, then open app again.");
+                stopSelf();
+                return;
+            }
+
             L("listening :" + PORT);
 
-            byte[] buf = new byte[32768];
-            int chunks = 0, peakAll = 0;
+            int chunks = 0;
+            int peakAll = 0;
+            int zeroStreak = 0;
 
             while (running) {
-                Socket client = audioServer.accept();
-                L("client masuk");
+                Socket client;
+                try {
+                    client = audioServer.accept();
+                } catch (java.net.SocketException se) {
+                    if (!running) break;
+                    throw se;
+                }
+
+                L("client connected");
+
                 try {
                     OutputStream out = client.getOutputStream();
+
                     while (running) {
                         int n = recorder.read(buf, 0, buf.length);
-                        if (n <= 0) { L("read=" + n + " -> putus, tunggu client baru"); break; }
-                        int peak = 0;
-                        for (int i = 0; i + 1 < n; i += 2) {
-                            int v = (short) ((buf[i + 1] << 8) | (buf[i] & 0xFF));
-                            if (v < 0) v = -v;
-                            if (v > peak) peak = v;
+
+                        if (n <= 0) {
+                            L("read returned " + n + " (negative = AudioRecord error code)");
+                            break;
                         }
+
+                        byte[] writeBuf;
+                        int writeLen;
+                        int peak;
+
+                        if (captureStereo) {
+                            int frames = n / 4;
+                            int need = frames * 2;
+
+                            if (monoBuf.length < need) {
+                                monoBuf = new byte[Math.max(need, monoBuf.length * 2)];
+                            }
+
+                            for (int i = 0, j = 0; i + 3 < n; i += 4, j += 2) {
+                                int l = (short) (((buf[i + 1] & 0xFF) << 8) | (buf[i] & 0xFF));
+                                int r = (short) (((buf[i + 3] & 0xFF) << 8) | (buf[i + 2] & 0xFF));
+                                int m = (l + r) / 2;
+
+                                monoBuf[j] = (byte) (m & 0xFF);
+                                monoBuf[j + 1] = (byte) ((m >> 8) & 0xFF);
+                            }
+
+                            writeBuf = monoBuf;
+                            writeLen = need;
+                        } else {
+                            writeBuf = buf;
+                            writeLen = n;
+                        }
+
+                        peak = peak16(writeBuf, writeLen);
+
                         if (peak > peakAll) peakAll = peak;
-                        if (chunks < 8) L("chunk" + chunks + " n=" + n + " peak=" + peak);
+
+                        if (peak == 0) {
+                            zeroStreak++;
+                        } else {
+                            zeroStreak = 0;
+                        }
+
+                        if (chunks < 12 || chunks % 50 == 0) {
+                            L("chunk" + chunks + " bytes=" + writeLen + " peak=" + peak + " zeroStreak=" + zeroStreak);
+                        }
+
                         chunks++;
-                        out.write(buf, 0, n);
+                        out.write(writeBuf, 0, writeLen);
+
+                        if (zeroStreak > 25) {
+                            L("WARNING: 25 consecutive silent chunks. Either no audible media, app blocks capture, or OEM blocks AudioPlaybackCapture.");
+                            zeroStreak = 0;
+                        }
                     }
+
                     out.flush();
                 } catch (IOException e) {
                     L("client io: " + e.getMessage());
                 } finally {
-                    try { client.close(); } catch (IOException ignored) {}
+                    try {
+                        client.close();
+                    } catch (IOException ignored) {}
                 }
             }
-            L("END peakMax=" + peakAll + " chunks=" + chunks);
+
+            L("END chunks=" + chunks + " peakMax=" + peakAll);
         } catch (Throwable t) {
             L("FATAL " + t);
-            for (StackTraceElement e : t.getStackTrace()) L("   at " + e);
+            for (StackTraceElement e : t.getStackTrace()) {
+                L("   at " + e);
+            }
         } finally {
             cleanup();
+            ACTIVE.set(false);
         }
     }
 
-    private void micSelfTest() {
-        int rate = 48000;
-        int minb = AudioRecord.getMinBufferSize(rate,
-            AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
-        AudioRecord mr = new AudioRecord(MediaRecorder.AudioSource.MIC, rate,
-            AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
-            Math.max(Math.abs(minb) * 2, 16384));
-        L("mic.state=" + mr.getState());
-        mr.startRecording();
-        byte[] b = new byte[8192];
-        int max = 0;
-        long t0 = SystemClock.elapsedRealtime();
-        while (SystemClock.elapsedRealtime() - t0 < 1200) {
-            int n = mr.read(b, 0, b.length);
-            if (n <= 0) break;
-            for (int i = 0; i + 1 < n; i += 2) {
-                int v = (short) ((b[i + 1] << 8) | (b[i] & 0xFF));
-                if (v < 0) v = -v;
-                if (v > max) max = v;
+    private int peak16(byte[] b, int len) {
+        int peak = 0;
+        for (int i = 0; i + 1 < len; i += 2) {
+            int raw = ((b[i + 1] & 0xFF) << 8) | (b[i] & 0xFF);
+            int v = (short) raw;
+            if (v < 0) v = -v;
+            if (v > peak) peak = v;
+        }
+        return peak;
+    }
+
+    private AudioRecord startPlaybackCapture(boolean wantStereo) {
+        captureStereo = false;
+
+        try {
+            AudioPlaybackCaptureConfiguration.Builder cb =
+                new AudioPlaybackCaptureConfiguration.Builder(projection);
+
+            int[] usages = new int[] {
+                AudioAttributes.USAGE_MEDIA,
+                AudioAttributes.USAGE_GAME,
+                AudioAttributes.USAGE_UNKNOWN,
+                AudioAttributes.USAGE_VOICE_COMMUNICATION,
+                AudioAttributes.USAGE_ALARM,
+                AudioAttributes.USAGE_NOTIFICATION,
+                AudioAttributes.USAGE_NOTIFICATION_RINGTONE,
+                AudioAttributes.USAGE_NOTIFICATION_COMMUNICATION_REQUEST,
+                AudioAttributes.USAGE_NOTIFICATION_COMMUNICATION_SETUP,
+                AudioAttributes.USAGE_NOTIFICATION_COMMUNICATION_ACCEPTED
+            };
+
+            for (int u : usages) {
+                cb.addMatchingUsage(u);
+            }
+
+            int rate = 48000;
+            int channel = wantStereo
+                ? AudioFormat.CHANNEL_IN_STEREO
+                : AudioFormat.CHANNEL_IN_MONO;
+
+            int minBuf = AudioRecord.getMinBufferSize(
+                rate,
+                channel,
+                AudioFormat.ENCODING_PCM_16BIT
+            );
+
+            L("try capture " + (wantStereo ? "stereo" : "mono") + " minBuf=" + minBuf);
+
+            if (minBuf <= 0) {
+                L("getMinBufferSize invalid for " + (wantStereo ? "stereo" : "mono"));
+                return null;
+            }
+
+            AudioRecord r = new AudioRecord.Builder()
+                .setAudioPlaybackCaptureConfig(cb.build())
+                .setAudioFormat(new AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(rate)
+                    .setChannelMask(channel)
+                    .build())
+                .setBufferSizeInBytes(Math.max(minBuf * 4, 131072))
+                .build();
+
+            L("capture state=" + r.getState() + " (1=INITIALIZED)");
+
+            if (r.getState() != AudioRecord.STATE_INITIALIZED) {
+                r.release();
+                return null;
+            }
+
+            r.startRecording();
+
+            int rs = r.getRecordingState();
+            L("capture recstate=" + rs + " (2=RECORDING)");
+
+            if (rs != AudioRecord.RECORDSTATE_RECORDING) {
+                SystemClock.sleep(300);
+                rs = r.getRecordingState();
+                L("capture recstate after wait=" + rs);
+
+                if (rs != AudioRecord.RECORDSTATE_RECORDING) {
+                    try {
+                        r.stop();
+                    } catch (Exception ignored) {}
+                    r.release();
+                    return null;
+                }
+            }
+
+            captureStereo = wantStereo;
+            return r;
+        } catch (Throwable t) {
+            L("capture start error: " + t);
+            return null;
+        }
+    }
+
+    private boolean micSelfTest() {
+        boolean any = false;
+
+        int[] sources = new int[] {
+            MediaRecorder.AudioSource.MIC,
+            MediaRecorder.AudioSource.VOICE_RECOGNITION,
+            MediaRecorder.AudioSource.CAMCORDER,
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION
+        };
+
+        String[] names = new String[] {
+            "MIC",
+            "VOICE_RECOGNITION",
+            "CAMCORDER",
+            "VOICE_COMMUNICATION"
+        };
+
+        for (int i = 0; i < sources.length; i++) {
+            try {
+                int rate = 48000;
+                int minb = AudioRecord.getMinBufferSize(
+                    rate,
+                    AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT
+                );
+
+                AudioRecord mr = new AudioRecord(
+                    sources[i],
+                    rate,
+                    AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                    Math.max(Math.abs(minb) * 2, 16384)
+                );
+
+                int st = mr.getState();
+                mr.startRecording();
+
+                byte[] b = new byte[8192];
+                int max = 0;
+                long t0 = SystemClock.elapsedRealtime();
+
+                while (SystemClock.elapsedRealtime() - t0 < 900) {
+                    int n = mr.read(b, 0, b.length);
+                    if (n <= 0) break;
+
+                    int p = peak16(b, n);
+                    if (p > max) max = p;
+                }
+
+                try {
+                    mr.stop();
+                } catch (Exception ignored) {}
+
+                mr.release();
+
+                L("mic[" + names[i] + "] state=" + st + " peak=" + max);
+
+                if (max > 0) any = true;
+            } catch (Throwable t) {
+                L("mic[" + names[i] + "] error " + t);
             }
         }
-        try { mr.stop(); } catch (Exception ignored) {}
-        mr.release();
-        L("mic.peak=" + max + " (>0 = mic hidup, =0 = mic mati/blokir)");
+
+        return any;
     }
 
     private void logServer() {
-        try (ServerSocket ds = new ServerSocket(LOGPORT, 4, InetAddress.getByName("127.0.0.1"))) {
+        try {
+            logServerSocket = new ServerSocket();
+            logServerSocket.setReuseAddress(true);
+            logServerSocket.bind(
+                new java.net.InetSocketAddress(InetAddress.getByName("127.0.0.1"), LOGPORT),
+                4
+            );
+
             while (running) {
-                try (Socket c = ds.accept()) {
-                    c.getOutputStream().write(log.toString().getBytes());
+                try (Socket c = logServerSocket.accept()) {
+                    byte[] payload;
+                    synchronized (log) {
+                        payload = log.toString().getBytes();
+                    }
+                    c.getOutputStream().write(payload);
                     c.getOutputStream().flush();
                 }
             }
@@ -170,24 +440,43 @@ public class CaptureService extends Service {
     }
 
     private Notification makeNotif() {
-        NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
-        nm.createNotificationChannel(new NotificationChannel("bridge", "AudioBridge",
-            NotificationManager.IMPORTANCE_LOW));
+        NotificationManager nm =
+            (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+
+        nm.createNotificationChannel(
+            new NotificationChannel("bridge", "AudioBridge", NotificationManager.IMPORTANCE_LOW)
+        );
+
         return new Notification.Builder(this, "bridge")
-            .setContentTitle("AudioBridge v2")
+            .setContentTitle("AudioBridge v3")
             .setContentText("port " + PORT + " audio | " + LOGPORT + " log")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-            .setOngoing(true).build();
+            .setOngoing(true)
+            .build();
     }
 
     private void cleanup() {
-        try { if (audioServer != null) audioServer.close(); } catch (Exception ignored) {}
+        try {
+            if (audioServer != null) audioServer.close();
+        } catch (Exception ignored) {}
+
+        try {
+            if (logServerSocket != null) logServerSocket.close();
+        } catch (Exception ignored) {}
+
         if (recorder != null) {
-            try { recorder.stop(); } catch (Exception ignored) {}
+            try {
+                recorder.stop();
+            } catch (Exception ignored) {}
             recorder.release();
+            recorder = null;
         }
+
         if (projection != null) {
-            try { projection.stop(); } catch (Exception ignored) {}
+            try {
+                projection.stop();
+            } catch (Exception ignored) {}
+            projection = null;
         }
     }
 
@@ -195,9 +484,12 @@ public class CaptureService extends Service {
     public void onDestroy() {
         running = false;
         cleanup();
+        ACTIVE.set(false);
         super.onDestroy();
     }
 
     @Override
-    public IBinder onBind(Intent i) { return null; }
+    public IBinder onBind(Intent i) {
+        return null;
+    }
 }

@@ -2,22 +2,30 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.termuxbridge.audiobridge">
 
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
 
-    <application android:label="AudioBridge" android:allowBackup="false">
+    <application
+        android:label="AudioBridge"
+        android:allowBackup="false">
 
-        <activity android:name=".MainActivity" android:exported="true">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
 
-        <service android:name=".CaptureService"
-            android:foregroundServiceType="mediaProjection"
+        <service
+            android:name=".CaptureService"
+            android:foregroundServiceType="mediaProjection|microphone"
             android:exported="false" />
     </application>
 </manifest>
