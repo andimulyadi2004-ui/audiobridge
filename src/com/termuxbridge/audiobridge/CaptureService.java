@@ -92,7 +92,7 @@ public class CaptureService extends Service {
 
     private void boot() {
         try {
-            L("=== AudioBridge v3 ===");
+            L("=== AudioBridge v3.1 ===");
             L("model=" + Build.MODEL + " brand=" + Build.BRAND + " sdk=" + Build.VERSION.SDK_INT);
 
             boolean micPerm = checkSelfPermission(Manifest.permission.RECORD_AUDIO)
@@ -106,7 +106,7 @@ public class CaptureService extends Service {
             }
 
             boolean micOk = micSelfTest();
-            L("micOverall=" + (micOk ? "OK" : "ZERO/BLOCKED"));
+            L("micOverall=" + (micOk ? "OK" : "ZERO/BLOCKED/NO_SOUND_DURING_TEST"));
 
             if (lastData == null) {
                 L("No projection data. Open app and Allow capture.");
@@ -124,6 +124,18 @@ public class CaptureService extends Service {
                 return;
             }
             L("projection OK");
+
+            try {
+                projection.registerCallback(new MediaProjection.Callback() {
+                    @Override
+                    public void onStop() {
+                        L("MediaProjection onStop: consent revoked/stopped");
+                        running = false;
+                    }
+                }, null);
+            } catch (Throwable t) {
+                L("registerCallback failed: " + t);
+            }
 
             recorder = startPlaybackCapture(true);
             if (recorder == null) {
@@ -269,25 +281,12 @@ public class CaptureService extends Service {
         captureStereo = false;
 
         try {
-            AudioPlaybackCaptureConfiguration.Builder cb =
-                new AudioPlaybackCaptureConfiguration.Builder(projection);
-
-            int[] usages = new int[] {
-                AudioAttributes.USAGE_MEDIA,
-                AudioAttributes.USAGE_GAME,
-                AudioAttributes.USAGE_UNKNOWN,
-                AudioAttributes.USAGE_VOICE_COMMUNICATION,
-                AudioAttributes.USAGE_ALARM,
-                AudioAttributes.USAGE_NOTIFICATION,
-                AudioAttributes.USAGE_NOTIFICATION_RINGTONE,
-                AudioAttributes.USAGE_NOTIFICATION_COMMUNICATION_REQUEST,
-                AudioAttributes.USAGE_NOTIFICATION_COMMUNICATION_SETUP,
-                AudioAttributes.USAGE_NOTIFICATION_COMMUNICATION_ACCEPTED
-            };
-
-            for (int u : usages) {
-                cb.addMatchingUsage(u);
-            }
+            AudioPlaybackCaptureConfiguration cfg =
+                new AudioPlaybackCaptureConfiguration.Builder(projection)
+                    .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                    .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                    .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                    .build();
 
             int rate = 48000;
             int channel = wantStereo
@@ -308,7 +307,7 @@ public class CaptureService extends Service {
             }
 
             AudioRecord r = new AudioRecord.Builder()
-                .setAudioPlaybackCaptureConfig(cb.build())
+                .setAudioPlaybackCaptureConfig(cfg)
                 .setAudioFormat(new AudioFormat.Builder()
                     .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                     .setSampleRate(rate)
@@ -327,14 +326,14 @@ public class CaptureService extends Service {
             r.startRecording();
 
             int rs = r.getRecordingState();
-            L("capture recstate=" + rs + " (2=RECORDING)");
+            L("capture recstate=" + rs + " (2=RECORDING, some OEM may use 3)");
 
-            if (rs != AudioRecord.RECORDSTATE_RECORDING) {
-                SystemClock.sleep(300);
+            if (rs != AudioRecord.RECORDSTATE_RECORDING && rs != 3) {
+                SystemClock.sleep(500);
                 rs = r.getRecordingState();
                 L("capture recstate after wait=" + rs);
 
-                if (rs != AudioRecord.RECORDSTATE_RECORDING) {
+                if (rs != AudioRecord.RECORDSTATE_RECORDING && rs != 3) {
                     try {
                         r.stop();
                     } catch (Exception ignored) {}
@@ -448,7 +447,7 @@ public class CaptureService extends Service {
         );
 
         return new Notification.Builder(this, "bridge")
-            .setContentTitle("AudioBridge v3")
+            .setContentTitle("AudioBridge v3.1")
             .setContentText("port " + PORT + " audio | " + LOGPORT + " log")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setOngoing(true)
